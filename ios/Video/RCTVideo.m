@@ -43,6 +43,7 @@ static int const RCTVideoUnset = -1;
   BOOL _videoLoadStarted;
 
   bool _pendingSeek;
+  bool _startWithAd;
   float _pendingSeekTime;
   float _lastSeekTime;
   
@@ -81,6 +82,7 @@ static int const RCTVideoUnset = -1;
 
 - (instancetype)initWithEventDispatcher:(RCTEventDispatcher *)eventDispatcher
 {
+  _startWithAd = true;
   if ((self = [super init])) {
     _eventDispatcher = eventDispatcher;
     
@@ -150,7 +152,8 @@ static int const RCTVideoUnset = -1;
     
     // Create ads rendering settings and tell the SDK to use the in-app browser.
     IMAAdsRenderingSettings *adsRenderingSettings = [[IMAAdsRenderingSettings alloc] init];
-    adsRenderingSettings.webOpenerPresentingController = self;
+    // datamints: Open in Safari not inline browser bv not configured
+    //adsRenderingSettings.webOpenerPresentingController = self;
     
     // Initialize the ads manager.
     [_adsManager initializeWithAdsRenderingSettings:adsRenderingSettings];
@@ -178,14 +181,22 @@ static int const RCTVideoUnset = -1;
 - (void)adsManager:(IMAAdsManager *)adsManager didReceiveAdEvent:(IMAAdEvent *)event {
     if (event.type == kIMAAdEvent_LOADED && self.onAdsLoaded) {
         self.onAdsLoaded(@{@"target": self.reactTag});
-    } else if (event.type == kIMAAdEvent_AD_BREAK_STARTED && self.onAdStarted) {
+    } else if (event.type == kIMAAdEvent_AD_BREAK_READY && self.onAdStarted) {
         self.onAdStarted(@{@"target": self.reactTag});
     } else if (event.type == kIMAAdEvent_ALL_ADS_COMPLETED && self.onAdsComplete) {
-        if (_adsManager) {
-            [_adsManager destroy];
-            _adsManager = nil;
-        }
-        self.onAdsComplete(@{@"target": self.reactTag});
+      if (_adsManager) {
+        [_adsManager destroy];
+        _adsManager = nil;
+        _startWithAd = false;
+
+        _player = [AVPlayer playerWithPlayerItem:_playerItem];
+        _contentPlayhead = [[IMAAVPlayerContentPlayhead alloc] initWithAVPlayer:_player];
+        _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+
+        [_player addObserver:self forKeyPath:playbackRate options:0 context:nil];
+        _playbackRateObserverRegistered = YES;
+      }
+      self.onAdsComplete(@{@"target": self.reactTag});
     }
 }
 
@@ -422,17 +433,20 @@ static int const RCTVideoUnset = -1;
         [_player removeObserver:self forKeyPath:playbackRate context:nil];
         _playbackRateObserverRegistered = NO;
       }
-        
-      _player = [AVPlayer playerWithPlayerItem:_playerItem];
-      _contentPlayhead = [[IMAAVPlayerContentPlayhead alloc] initWithAVPlayer:_player];
-      _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-        
-      [_player addObserver:self forKeyPath:playbackRate options:0 context:nil];
-      _playbackRateObserverRegistered = YES;
-        
-      [self addPlayerTimeObserver];
-        
-      //Perform on next run loop, otherwise onVideoLoadStart is nil
+
+      if (self.onAdError) {
+        // is marker for "Start with Advertisement"
+      } else {
+        _player = [AVPlayer playerWithPlayerItem:_playerItem];
+        _contentPlayhead = [[IMAAVPlayerContentPlayhead alloc] initWithAVPlayer:_player];
+        _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+
+        [_player addObserver:self forKeyPath:playbackRate options:0 context:nil];
+        _playbackRateObserverRegistered = YES;
+
+        [self addPlayerTimeObserver];
+      }
+      // Perform on next run loop, otherwise onVideoLoadStart is nil
       if (self.onVideoLoadStart) {
         id uri = [source objectForKey:@"uri"];
         id type = [source objectForKey:@"type"];
@@ -1202,7 +1216,7 @@ static int const RCTVideoUnset = -1;
       if(self.onVideoFullscreenPlayerWillPresent) {
         self.onVideoFullscreenPlayerWillPresent(@{@"target": self.reactTag});
       }
-      [viewController presentViewController:_playerViewController animated:true completion:^{
+      [viewController presentViewController:_playerViewController animated:YES completion:^{
         _playerViewController.showsPlaybackControls = YES;
         _fullscreenPlayerPresented = fullscreen;
         if(self.onVideoFullscreenPlayerDidPresent) {
@@ -1214,7 +1228,7 @@ static int const RCTVideoUnset = -1;
   else if ( !fullscreen && _fullscreenPlayerPresented )
   {
     [self videoPlayerViewControllerWillDismiss:_playerViewController];
-    [_presentingViewController dismissViewControllerAnimated:true completion:^{
+    [_presentingViewController dismissViewControllerAnimated:YES completion:^{
       [self videoPlayerViewControllerDidDismiss:_playerViewController];
     }];
   }
