@@ -17,6 +17,7 @@ static NSString *const playbackBufferEmptyKeyPath = @"playbackBufferEmpty";
 static NSString *const readyForDisplayKeyPath = @"readyForDisplay";
 static NSString *const playbackRate = @"rate";
 static NSString *const timedMetadata = @"timedMetadata";
+static NSString *const externalPlaybackActive = @"externalPlaybackActive";
 
 static int const RCTVideoUnset = -1;
 
@@ -28,78 +29,92 @@ static int const RCTVideoUnset = -1;
 
 @implementation RCTVideo
 {
-    AVPlayer *_player;
-    AVPlayerItem *_playerItem;
-    BOOL _playerItemObserversSet;
-    BOOL _playerBufferEmpty;
-    AVPlayerLayer *_playerLayer;
-    BOOL _playerLayerObserverSet;
-    AVPlayerViewController *_playerViewController;
-    NSURL *_videoURL;
-    
-    /* Required to publish events */
-    RCTEventDispatcher *_eventDispatcher;
-    BOOL _playbackRateObserverRegistered;
-    BOOL _videoLoadStarted;
-    
-    bool _pendingSeek;
-    float _pendingSeekTime;
-    float _lastSeekTime;
-    
-    /* For sending videoProgress events */
-    Float64 _progressUpdateInterval;
-    BOOL _controls;
-    id _timeObserver;
-    
-    /* Keep track of any modifiers, need to be applied after each play */
-    float _volume;
-    float _rate;
-    BOOL _muted;
-    BOOL _paused;
-    BOOL _repeat;
-    BOOL _allowsExternalPlayback;
-    NSArray * _textTracks;
-    NSDictionary * _selectedTextTrack;
-    NSDictionary * _selectedAudioTrack;
-    BOOL _playbackStalled;
-    BOOL _playInBackground;
-    BOOL _playWhenInactive;
-    NSString * _ignoreSilentSwitch;
-    NSString * _resizeMode;
-    BOOL _fullscreenPlayerPresented;
-    UIViewController * _presentingViewController;
-    
-    /* Ads Loader */
-    IMAAdsLoader * _adsLoader;
-    IMAAVPlayerContentPlayhead * _contentPlayhead;
-    IMAAdsManager * _adsManager;
-    
+  AVPlayer *_player;
+  AVPlayerItem *_playerItem;
+  NSDictionary *_source;
+  BOOL _playerItemObserversSet;
+  BOOL _playerBufferEmpty;
+  AVPlayerLayer *_playerLayer;
+  BOOL _playerLayerObserverSet;
+  RCTVideoPlayerViewController *_playerViewController;
+  NSURL *_videoURL;
+  
+  /* Required to publish events */
+  RCTEventDispatcher *_eventDispatcher;
+  BOOL _playbackRateObserverRegistered;
+  BOOL _isExternalPlaybackActiveObserverRegistered;
+  BOOL _videoLoadStarted;
+  
+  bool _pendingSeek;
+  float _pendingSeekTime;
+  float _lastSeekTime;
+  
+  /* For sending videoProgress events */
+  Float64 _progressUpdateInterval;
+  BOOL _controls;
+  id _timeObserver;
+  
+  /* Keep track of any modifiers, need to be applied after each play */
+  float _volume;
+  float _rate;
+  float _maxBitRate;
+
+  BOOL _muted;
+  BOOL _paused;
+  BOOL _repeat;
+  BOOL _allowsExternalPlayback;
+  NSArray * _textTracks;
+  NSDictionary * _selectedTextTrack;
+  NSDictionary * _selectedAudioTrack;
+  BOOL _playbackStalled;
+  BOOL _playInBackground;
+  BOOL _playWhenInactive;
+  BOOL _pictureInPicture;
+  NSString * _ignoreSilentSwitch;
+  NSString * _resizeMode;
+  BOOL _fullscreen;
+  BOOL _fullscreenAutorotate;
+  NSString * _fullscreenOrientation;
+  BOOL _fullscreenPlayerPresented;
+  NSString *_filterName;
+  BOOL _filterEnabled;
+  UIViewController * _presentingViewController;
 #if __has_include(<react-native-video/RCTVideoCache.h>)
     RCTVideoCache * _videoCache;
+#endif
+#if TARGET_OS_IOS
+  void (^__strong _Nonnull _restoreUserInterfaceForPIPStopCompletionHandler)(BOOL);
+  AVPictureInPictureController *_pipController;
 #endif
 }
 
 - (instancetype)initWithEventDispatcher:(RCTEventDispatcher *)eventDispatcher
 {
-    if ((self = [super init])) {
-        _eventDispatcher = eventDispatcher;
-        
-        _playbackRateObserverRegistered = NO;
-        _playbackStalled = NO;
-        _rate = 1.0;
-        _volume = 1.0;
-        _resizeMode = @"AVLayerVideoGravityResizeAspectFill";
-        _pendingSeek = false;
-        _pendingSeekTime = 0.0f;
-        _lastSeekTime = 0.0f;
-        _progressUpdateInterval = 250;
-        _controls = NO;
-        _playerBufferEmpty = YES;
-        _playInBackground = false;
-        _allowsExternalPlayback = YES;
-        _playWhenInactive = false;
-        _ignoreSilentSwitch = @"inherit"; // inherit, ignore, obey
-        
+  if ((self = [super init])) {
+    _eventDispatcher = eventDispatcher;
+    
+    _playbackRateObserverRegistered = NO;
+    _isExternalPlaybackActiveObserverRegistered = NO;
+    _playbackStalled = NO;
+    _rate = 1.0;
+    _volume = 1.0;
+    _resizeMode = @"AVLayerVideoGravityResizeAspectFill";
+    _fullscreenAutorotate = YES;
+    _fullscreenOrientation = @"all";
+    _pendingSeek = false;
+    _pendingSeekTime = 0.0f;
+    _lastSeekTime = 0.0f;
+    _progressUpdateInterval = 250;
+    _controls = NO;
+    _playerBufferEmpty = YES;
+    _playInBackground = false;
+    _allowsExternalPlayback = YES;
+    _playWhenInactive = false;
+    _pictureInPicture = false;
+    _ignoreSilentSwitch = @"inherit"; // inherit, ignore, obey
+#if TARGET_OS_IOS
+    _restoreUserInterfaceForPIPStopCompletionHandler = NULL;
+#endif
 #if __has_include(<react-native-video/RCTVideoCache.h>)
         _videoCache = [RCTVideoCache sharedInstance];
 #endif
@@ -147,62 +162,30 @@ static int const RCTVideoUnset = -1;
         return;
     }
     
-    _adsLoader = [[IMAAdsLoader alloc] initWithSettings:nil];
-    _adsLoader.delegate = self;
-    // Create an ad display container for ad rendering.
-    IMAAdDisplayContainer *adDisplayContainer =
-    [[IMAAdDisplayContainer alloc] initWithAdContainer:self companionSlots:nil];
-    // Create an ad request with our ad tag, display container, and optional user context.
-    IMAAdsRequest *request = [[IMAAdsRequest alloc] initWithAdTagUrl:adTagUrl
-                                                  adDisplayContainer:adDisplayContainer
-                                                     contentPlayhead:_contentPlayhead
-                                                         userContext:nil];
-    [_adsLoader requestAdsWithRequest:request];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(applicationWillEnterForeground:)
+                                                 name:UIApplicationWillEnterForegroundNotification
+                                               object:nil];
+    
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(audioRouteChanged:)
+                                                 name:AVAudioSessionRouteChangeNotification
+                                               object:nil];
+  }
+  
+  return self;
 }
 
-- (void)adsLoader:(IMAAdsLoader *)loader adsLoadedWithData:(IMAAdsLoadedData *)adsLoadedData {
-    // Grab the instance of the IMAAdsManager and set ourselves as the delegate.
-    _adsManager = adsLoadedData.adsManager;
+- (RCTVideoPlayerViewController*)createPlayerViewController:(AVPlayer*)player
+                                             withPlayerItem:(AVPlayerItem*)playerItem {
+    RCTVideoPlayerViewController* viewController = [[RCTVideoPlayerViewController alloc] init];
+    viewController.showsPlaybackControls = YES;
+    viewController.rctDelegate = self;
+    viewController.preferredOrientation = _fullscreenOrientation;
     
-    _adsManager.delegate = self;
-    
-    // Create ads rendering settings and tell the SDK to use the in-app browser.
-    IMAAdsRenderingSettings *adsRenderingSettings = [[IMAAdsRenderingSettings alloc] init];
-    // datamints: Open in Safari not inline browser bv not configured
-    //adsRenderingSettings.webOpenerPresentingController = self;
-    
-    // Initialize the ads manager.
-    [_adsManager initializeWithAdsRenderingSettings:adsRenderingSettings];
-}
-
-- (void)adsLoader:(IMAAdsLoader *)loader failedWithErrorData:(IMAAdLoadingErrorData *)adErrorData {
-    // Something went wrong loading ads. Log the error and play the content.
-    NSLog(@"Error loading ads: %@", adErrorData.adError.message);
-    if (self.onAdError) {
-        self.onAdError(@{@"target": self.reactTag});
-    }
-    
-    // Init player after ad error.
-    _player = [AVPlayer playerWithPlayerItem:_playerItem];
-    _contentPlayhead = [[IMAAVPlayerContentPlayhead alloc] initWithAVPlayer:_player];
-    _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-    
-    [_player addObserver:self forKeyPath:playbackRate options:0 context:nil];
-    _playbackRateObserverRegistered = YES;
-    
-    [self addPlayerTimeObserver];
-    
-    [_player play];
-}
-
-- (AVPlayerViewController*)createPlayerViewController:(AVPlayer*)player withPlayerItem:(AVPlayerItem*)playerItem {
-    RCTVideoPlayerViewController* playerLayer= [[RCTVideoPlayerViewController alloc] init];
-    playerLayer.showsPlaybackControls = YES;
-    playerLayer.rctDelegate = self;
-    playerLayer.view.frame = self.bounds;
-    playerLayer.player = player;
-    playerLayer.view.frame = self.bounds;
-    return playerLayer;
+    viewController.view.frame = self.bounds;
+    viewController.player = player;
+    return viewController;
 }
 
 - (void)adsManager:(IMAAdsManager *)adsManager didReceiveAdEvent:(IMAAdEvent *)event {
@@ -303,10 +286,11 @@ static int const RCTVideoUnset = -1;
 
 - (void)dealloc
 {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [self removePlayerLayer];
-    [self removePlayerItemObservers];
-    [_player removeObserver:self forKeyPath:playbackRate context:nil];
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
+  [self removePlayerLayer];
+  [self removePlayerItemObservers];
+  [_player removeObserver:self forKeyPath:playbackRate context:nil];
+  [_player removeObserver:self forKeyPath:externalPlaybackActive context: nil];
 }
 
 #pragma mark - App lifecycle handlers
@@ -345,7 +329,7 @@ static int const RCTVideoUnset = -1;
     NSNumber *reason = [[notification userInfo] objectForKey:AVAudioSessionRouteChangeReasonKey];
     NSNumber *previousRoute = [[notification userInfo] objectForKey:AVAudioSessionRouteChangePreviousRouteKey];
     if (reason.unsignedIntValue == AVAudioSessionRouteChangeReasonOldDeviceUnavailable) {
-        self.onVideoAudioBecomingNoisy(@{@"target": self.reactTag});
+      self.onVideoAudioBecomingNoisy(@{@"target": self.reactTag});
     }
 }
 
@@ -443,132 +427,148 @@ static int const RCTVideoUnset = -1;
 
 - (void)setSrc:(NSDictionary *)source
 {
-    [self removePlayerLayer];
-    [self removePlayerTimeObserver];
-    [self removePlayerItemObservers];
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) 0), dispatch_get_main_queue(), ^{
+  _source = source;
+  [self removePlayerLayer];
+  [self removePlayerTimeObserver];
+  [self removePlayerItemObservers];
+
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) 0), dispatch_get_main_queue(), ^{
+
+    // perform on next run loop, otherwise other passed react-props may not be set
+    [self playerItemForSource:source withCallback:^(AVPlayerItem * playerItem) {
+      _playerItem = playerItem;
+      [self addPlayerItemObservers];
+      [self setFilter:_filterName];
+      [self setMaxBitRate:_maxBitRate];
+      
+      [_player pause];
+      [_playerViewController.view removeFromSuperview];
+      _playerViewController = nil;
         
-        // perform on next run loop, otherwise other passed react-props may not be set
-        [self playerItemForSource:source withCallback:^(AVPlayerItem * playerItem) {
-            _playerItem = playerItem;
-            [self addPlayerItemObservers];
-            
-            [_player pause];
-            [_playerViewController.view removeFromSuperview];
-            _playerViewController = nil;
-            
-            if (_playbackRateObserverRegistered) {
-                [_player removeObserver:self forKeyPath:playbackRate context:nil];
-                _playbackRateObserverRegistered = NO;
-            }
-            
-            // Moved to requestAds, onAdError and onAdsCompleted because if the player is initialized before the ad has played a video still image is displayed!
-            //_player = [AVPlayer playerWithPlayerItem:_playerItem];
-            //_contentPlayhead = [[IMAAVPlayerContentPlayhead alloc] initWithAVPlayer:_player];
-            //_player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-            
-            //[_player addObserver:self forKeyPath:playbackRate options:0 context:nil];
-            //_playbackRateObserverRegistered = YES;
-            
-            //[self addPlayerTimeObserver];
-            
-            // Perform on next run loop, otherwise onVideoLoadStart is nil
-            if (self.onVideoLoadStart) {
-                id uri = [source objectForKey:@"uri"];
-                id type = [source objectForKey:@"type"];
-                self.onVideoLoadStart(@{@"src": @{
-                                                @"uri": uri ? uri : [NSNull null],
-                                                @"type": type ? type : [NSNull null],
-                                                @"isNetwork": [NSNumber numberWithBool:(bool)[source objectForKey:@"isNetwork"]]},
-                                        @"target": self.reactTag
-                                        });
-            }
-        }];
-    });
-    _videoLoadStarted = YES;
+      if (_playbackRateObserverRegistered) {
+        [_player removeObserver:self forKeyPath:playbackRate context:nil];
+        _playbackRateObserverRegistered = NO;
+      }
+      if (_isExternalPlaybackActiveObserverRegistered) {
+        [_player removeObserver:self forKeyPath:externalPlaybackActive context:nil];
+        _isExternalPlaybackActiveObserverRegistered = NO;
+      }
+        
+      _player = [AVPlayer playerWithPlayerItem:_playerItem];
+      _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+        
+      [_player addObserver:self forKeyPath:playbackRate options:0 context:nil];
+      _playbackRateObserverRegistered = YES;
+      
+      [_player addObserver:self forKeyPath:externalPlaybackActive options:0 context:nil];
+      _isExternalPlaybackActiveObserverRegistered = YES;
+        
+      [self addPlayerTimeObserver];
+
+      //Perform on next run loop, otherwise onVideoLoadStart is nil
+      if (self.onVideoLoadStart) {
+        id uri = [source objectForKey:@"uri"];
+        id type = [source objectForKey:@"type"];
+        self.onVideoLoadStart(@{@"src": @{
+                                        @"uri": uri ? uri : [NSNull null],
+                                        @"type": type ? type : [NSNull null],
+                                        @"isNetwork": [NSNumber numberWithBool:(bool)[source objectForKey:@"isNetwork"]]},
+                                    @"target": self.reactTag
+                                });
+      }
+    }];
+  });
+  _videoLoadStarted = YES;
 }
 
 - (NSURL*) urlFilePath:(NSString*) filepath {
-    if ([filepath containsString:@"file://"]) {
-        return [NSURL URLWithString:filepath];
-    }
-    
-    // code to support local caching
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString* relativeFilePath = [filepath lastPathComponent];
-    // the file may be multiple levels below the documents directory
-    NSArray* fileComponents = [filepath componentsSeparatedByString:@"Documents/"];
-    if (fileComponents.count > 1) {
-        relativeFilePath = [fileComponents objectAtIndex:1];
-    }
-    
-    NSString *path = [paths.firstObject stringByAppendingPathComponent:relativeFilePath];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        return [NSURL fileURLWithPath:path];
-    }
-    return nil;
+  if ([filepath containsString:@"file://"]) {
+    return [NSURL URLWithString:filepath];
+  }
+  
+  // if no file found, check if the file exists in the Document directory
+  NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+  NSString* relativeFilePath = [filepath lastPathComponent];
+  // the file may be multiple levels below the documents directory
+  NSArray* fileComponents = [filepath componentsSeparatedByString:@"Documents/"];
+  if (fileComponents.count > 1) {
+    relativeFilePath = [fileComponents objectAtIndex:1];
+  }
+  
+  NSString *path = [paths.firstObject stringByAppendingPathComponent:relativeFilePath];
+  if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+    return [NSURL fileURLWithPath:path];
+  }
+  return nil;
 }
 
 - (void)playerItemPrepareText:(AVAsset *)asset assetOptions:(NSDictionary * __nullable)assetOptions withCallback:(void(^)(AVPlayerItem *))handler
 {
-    if (!_textTracks) {
-        handler([AVPlayerItem playerItemWithAsset:asset]);
-        return;
+  if (!_textTracks || _textTracks.count==0) {
+    handler([AVPlayerItem playerItemWithAsset:asset]);
+    return;
+  }
+  
+  // AVPlayer can't airplay AVMutableCompositions
+  _allowsExternalPlayback = NO;
+
+  // sideload text tracks
+  AVMutableComposition *mixComposition = [[AVMutableComposition alloc] init];
+  
+  AVAssetTrack *videoAsset = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+  AVMutableCompositionTrack *videoCompTrack = [mixComposition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+  [videoCompTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, videoAsset.timeRange.duration)
+                          ofTrack:videoAsset
+                           atTime:kCMTimeZero
+                            error:nil];
+  
+  AVAssetTrack *audioAsset = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+  AVMutableCompositionTrack *audioCompTrack = [mixComposition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+  [audioCompTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, videoAsset.timeRange.duration)
+                          ofTrack:audioAsset
+                           atTime:kCMTimeZero
+                            error:nil];
+  
+  NSMutableArray* validTextTracks = [NSMutableArray array];
+  for (int i = 0; i < _textTracks.count; ++i) {
+    AVURLAsset *textURLAsset;
+    NSString *textUri = [_textTracks objectAtIndex:i][@"uri"];
+    if ([[textUri lowercaseString] hasPrefix:@"http"]) {
+      textURLAsset = [AVURLAsset URLAssetWithURL:[NSURL URLWithString:textUri] options:assetOptions];
+    } else {
+      textURLAsset = [AVURLAsset URLAssetWithURL:[self urlFilePath:textUri] options:nil];
     }
-    
-    // sideload text tracks
-    AVMutableComposition *mixComposition = [[AVMutableComposition alloc] init];
-    
-    AVAssetTrack *videoAsset = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
-    AVMutableCompositionTrack *videoCompTrack = [mixComposition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
-    [videoCompTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, videoAsset.timeRange.duration)
-                            ofTrack:videoAsset
-                             atTime:kCMTimeZero
-                              error:nil];
-    
-    AVAssetTrack *audioAsset = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
-    AVMutableCompositionTrack *audioCompTrack = [mixComposition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
-    [audioCompTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, videoAsset.timeRange.duration)
-                            ofTrack:audioAsset
-                             atTime:kCMTimeZero
-                              error:nil];
-    
-    NSMutableArray* validTextTracks = [NSMutableArray array];
-    for (int i = 0; i < _textTracks.count; ++i) {
-        AVURLAsset *textURLAsset;
-        NSString *textUri = [_textTracks objectAtIndex:i][@"uri"];
-        if ([[textUri lowercaseString] hasPrefix:@"http"]) {
-            textURLAsset = [AVURLAsset URLAssetWithURL:[NSURL URLWithString:textUri] options:assetOptions];
-        } else {
-            textURLAsset = [AVURLAsset URLAssetWithURL:[self urlFilePath:textUri] options:nil];
-        }
-        AVAssetTrack *textTrackAsset = [textURLAsset tracksWithMediaType:AVMediaTypeText].firstObject;
-        if (!textTrackAsset) continue; // fix when there's no textTrackAsset
-        [validTextTracks addObject:[_textTracks objectAtIndex:i]];
-        AVMutableCompositionTrack *textCompTrack = [mixComposition
-                                                    addMutableTrackWithMediaType:AVMediaTypeText
-                                                    preferredTrackID:kCMPersistentTrackID_Invalid];
-        [textCompTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, videoAsset.timeRange.duration)
-                               ofTrack:textTrackAsset
-                                atTime:kCMTimeZero
-                                 error:nil];
-    }
-    if (validTextTracks.count != _textTracks.count) {
-        [self setTextTracks:validTextTracks];
-    }
-    
-    handler([AVPlayerItem playerItemWithAsset:mixComposition]);
+    AVAssetTrack *textTrackAsset = [textURLAsset tracksWithMediaType:AVMediaTypeText].firstObject;
+    if (!textTrackAsset) continue; // fix when there's no textTrackAsset
+    [validTextTracks addObject:[_textTracks objectAtIndex:i]];
+    AVMutableCompositionTrack *textCompTrack = [mixComposition
+                                                addMutableTrackWithMediaType:AVMediaTypeText
+                                                preferredTrackID:kCMPersistentTrackID_Invalid];
+    [textCompTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, videoAsset.timeRange.duration)
+                           ofTrack:textTrackAsset
+                            atTime:kCMTimeZero
+                             error:nil];
+  }
+  if (validTextTracks.count != _textTracks.count) {
+    [self setTextTracks:validTextTracks];
+  }
+
+  handler([AVPlayerItem playerItemWithAsset:mixComposition]);
 }
 
 - (void)playerItemForSource:(NSDictionary *)source withCallback:(void(^)(AVPlayerItem *))handler
 {
-    bool isNetwork = [RCTConvert BOOL:[source objectForKey:@"isNetwork"]];
-    bool isAsset = [RCTConvert BOOL:[source objectForKey:@"isAsset"]];
-    NSString *uri = [source objectForKey:@"uri"];
-    NSString *type = [source objectForKey:@"type"];
-    
-    NSURL *url = isNetwork || isAsset
+  bool isNetwork = [RCTConvert BOOL:[source objectForKey:@"isNetwork"]];
+  bool isAsset = [RCTConvert BOOL:[source objectForKey:@"isAsset"]];
+  bool shouldCache = [RCTConvert BOOL:[source objectForKey:@"shouldCache"]];
+  NSString *uri = [source objectForKey:@"uri"];
+  NSString *type = [source objectForKey:@"type"];
+  if (!uri || [uri isEqualToString:@""]) {
+    DebugLog(@"Could not find video URL in source '%@'", source);
+    return;
+  }
+
+  NSURL *url = isNetwork || isAsset
     ? [NSURL URLWithString:uri]
     : [[NSURL alloc] initFileURLWithPath:[[NSBundle mainBundle] pathForResource:uri ofType:type]];
     NSMutableDictionary *assetOptions = [[NSMutableDictionary alloc] init];
@@ -585,15 +585,15 @@ static int const RCTVideoUnset = -1;
         [assetOptions setObject:cookies forKey:AVURLAssetHTTPCookiesKey];
         
 #if __has_include(<react-native-video/RCTVideoCache.h>)
-        if (!_textTracks) {
-            /* The DVURLAsset created by cache doesn't have a tracksWithMediaType property, so trying
-             *  to bring in the text track code will crash. I suspect this is because the asset hasn't fully loaded.
-             * Until this is fixed, we need to bypass caching when text tracks are specified.
-             */
-            DebugLog(@"Caching is not supported for uri '%@' because text tracks are not compatible with the cache. Checkout https://github.com/react-native-community/react-native-video/blob/master/docs/caching.md", uri);
-            [self playerItemForSourceUsingCache:uri assetOptions:assetOptions withCallback:handler];
-            return;
-        }
+    if (shouldCache && (!_textTracks || !_textTracks.count)) {
+      /* The DVURLAsset created by cache doesn't have a tracksWithMediaType property, so trying
+       * to bring in the text track code will crash. I suspect this is because the asset hasn't fully loaded.
+       * Until this is fixed, we need to bypass caching when text tracks are specified.
+       */
+      DebugLog(@"Caching is not supported for uri '%@' because text tracks are not compatible with the cache. Checkout https://github.com/react-native-community/react-native-video/blob/master/docs/caching.md", uri);
+      [self playerItemForSourceUsingCache:uri assetOptions:assetOptions withCallback:handler];
+      return;
+    }
 #endif
         
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:assetOptions];
@@ -631,7 +631,7 @@ static int const RCTVideoUnset = -1;
                 if (cachedAsset) {
                     DebugLog(@"Playing back uri '%@' from cache", uri);
                     // See note in playerItemForSource about not being able to support text tracks & caching
-                    handler([AVPlayerItem playerItemWithAsset:asset]);
+                    handler([AVPlayerItem playerItemWithAsset:cachedAsset]);
                     return;
                 }
         }
@@ -666,28 +666,58 @@ static int const RCTVideoUnset = -1;
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context
 {
-    if (object == _playerItem) {
-        // When timeMetadata is read the event onTimedMetadata is triggered
-        if ([keyPath isEqualToString:timedMetadata]) {
-            NSArray<AVMetadataItem *> *items = [change objectForKey:@"new"];
-            if (items && ![items isEqual:[NSNull null]] && items.count > 0) {
-                NSMutableArray *array = [NSMutableArray new];
-                for (AVMetadataItem *item in items) {
-                    NSString *value = (NSString *)item.value;
-                    NSString *identifier = item.identifier;
-                    
-                    if (![value isEqual: [NSNull null]]) {
-                        NSDictionary *dictionary = [[NSDictionary alloc] initWithObjects:@[value, identifier] forKeys:@[@"value", @"identifier"]];
-                        
-                        [array addObject:dictionary];
-                    }
-                }
-                
-                self.onTimedMetadata(@{
-                                       @"target": self.reactTag,
-                                       @"metadata": array
-                                       });
-            }
+  // when controls==true, this is a hack to reset the rootview when rotation happens in fullscreen
+  if (object == _playerViewController.contentOverlayView) {
+    if ([keyPath isEqualToString:@"frame"]) {
+      
+      CGRect oldRect = [change[NSKeyValueChangeOldKey] CGRectValue];
+      CGRect newRect = [change[NSKeyValueChangeNewKey] CGRectValue];
+      
+      if (!CGRectEqualToRect(oldRect, newRect)) {
+        if (CGRectEqualToRect(newRect, [UIScreen mainScreen].bounds)) {
+          NSLog(@"in fullscreen");
+        } else NSLog(@"not fullscreen");
+        
+        [self.reactViewController.view setFrame:[UIScreen mainScreen].bounds];
+        [self.reactViewController.view setNeedsLayout];
+      }
+      
+      return;
+    } else
+      return [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+  }
+  
+  if (object == _playerItem) {
+    // When timeMetadata is read the event onTimedMetadata is triggered
+    if ([keyPath isEqualToString:timedMetadata]) {
+      NSArray<AVMetadataItem *> *items = [change objectForKey:@"new"];
+      if (items && ![items isEqual:[NSNull null]] && items.count > 0) {
+        NSMutableArray *array = [NSMutableArray new];
+        for (AVMetadataItem *item in items) {
+          NSString *value = (NSString *)item.value;
+          NSString *identifier = item.identifier;
+          
+          if (![value isEqual: [NSNull null]]) {
+            NSDictionary *dictionary = [[NSDictionary alloc] initWithObjects:@[value, identifier] forKeys:@[@"value", @"identifier"]];
+            
+            [array addObject:dictionary];
+          }
+        }
+        
+        self.onTimedMetadata(@{
+                               @"target": self.reactTag,
+                               @"metadata": array
+                               });
+      }
+    }
+    
+    if ([keyPath isEqualToString:statusKeyPath]) {
+      // Handle player item status change.
+      if (_playerItem.status == AVPlayerItemStatusReadyToPlay) {
+        float duration = CMTimeGetSeconds(_playerItem.asset.duration);
+        
+        if (isnan(duration)) {
+          duration = 0.0;
         }
         
         if ([keyPath isEqualToString:statusKeyPath]) {
@@ -780,26 +810,55 @@ static int const RCTVideoUnset = -1;
     } else {
         [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
     }
+    else if([keyPath isEqualToString:externalPlaybackActive]) {
+        if(self.onVideoExternalPlaybackChange) {
+          self.onVideoExternalPlaybackChange(@{@"isExternalPlaybackActive": [NSNumber numberWithBool:_player.isExternalPlaybackActive],
+                                          @"target": self.reactTag});
+        }
+    }
+  } else {
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+  }
 }
 
 - (void)attachListeners
 {
-    // listen for end of file
-    [[NSNotificationCenter defaultCenter] removeObserver:self
-                                                    name:AVPlayerItemDidPlayToEndTimeNotification
-                                                  object:[_player currentItem]];
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(playerItemDidReachEnd:)
-                                                 name:AVPlayerItemDidPlayToEndTimeNotification
-                                               object:[_player currentItem]];
+  // listen for end of file
+  [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                  name:AVPlayerItemDidPlayToEndTimeNotification
+                                                object:[_player currentItem]];
+  [[NSNotificationCenter defaultCenter] addObserver:self
+                                           selector:@selector(playerItemDidReachEnd:)
+                                               name:AVPlayerItemDidPlayToEndTimeNotification
+                                             object:[_player currentItem]];
+  
+  [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                  name:AVPlayerItemPlaybackStalledNotification
+                                                object:nil];
+  [[NSNotificationCenter defaultCenter] addObserver:self
+                                           selector:@selector(playbackStalled:)
+                                               name:AVPlayerItemPlaybackStalledNotification
+                                             object:nil];
+
+  [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                  name:AVPlayerItemNewAccessLogEntryNotification
+                                                object:nil];
+  [[NSNotificationCenter defaultCenter] addObserver:self
+                                           selector:@selector(handleAVPlayerAccess:)
+                                               name:AVPlayerItemNewAccessLogEntryNotification
+                                             object:nil];
+
+}
+
+- (void)handleAVPlayerAccess:(NSNotification *)notification {
+    AVPlayerItemAccessLog *accessLog = [((AVPlayerItem *)notification.object) accessLog];
+    AVPlayerItemAccessLogEvent *lastEvent = accessLog.events.lastObject;
     
-    [[NSNotificationCenter defaultCenter] removeObserver:self
-                                                    name:AVPlayerItemPlaybackStalledNotification
-                                                  object:nil];
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(playbackStalled:)
-                                                 name:AVPlayerItemPlaybackStalledNotification
-                                               object:nil];
+    /* TODO: get this working
+    if (self.onBandwidthUpdate) {
+        self.onBandwidthUpdate(@{@"bitrate": [NSNumber numberWithFloat:lastEvent.observedBitrate]});
+    }
+    */
 }
 
 - (void)playbackStalled:(NSNotification *)notification
@@ -855,6 +914,44 @@ static int const RCTVideoUnset = -1;
 {
     _playWhenInactive = playWhenInactive;
 }
+
+- (void)setPictureInPicture:(BOOL)pictureInPicture
+{
+  #if TARGET_OS_IOS
+  if (_pictureInPicture == pictureInPicture) {
+    return;
+  }
+
+  _pictureInPicture = pictureInPicture;
+  if (_pipController && _pictureInPicture && ![_pipController isPictureInPictureActive]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [_pipController startPictureInPicture];
+    });
+  } else if (_pipController && !_pictureInPicture && [_pipController isPictureInPictureActive]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [_pipController stopPictureInPicture];
+	});
+  }
+  #endif
+}
+
+#if TARGET_OS_IOS
+- (void)setRestoreUserInterfaceForPIPStopCompletionHandler:(BOOL)restore
+{
+  if (_restoreUserInterfaceForPIPStopCompletionHandler != NULL) {
+    _restoreUserInterfaceForPIPStopCompletionHandler(restore);
+    _restoreUserInterfaceForPIPStopCompletionHandler = NULL;
+  }
+}
+
+- (void)setupPipController {
+  if (!_pipController && _playerLayer && [AVPictureInPictureController isPictureInPictureSupported]) {
+    // Create new controller passing reference to the AVPlayerLayer
+    _pipController = [[AVPictureInPictureController alloc] initWithPlayerLayer:_playerLayer];
+    _pipController.delegate = self;
+  }
+}
+#endif
 
 - (void)setIgnoreSilentSwitch:(NSString *)ignoreSilentSwitch
 {
@@ -955,23 +1052,30 @@ static int const RCTVideoUnset = -1;
     [self applyModifiers];
 }
 
+- (void)setMaxBitRate:(float) maxBitRate {
+  _maxBitRate = maxBitRate;
+  _playerItem.preferredPeakBitRate = maxBitRate;
+}
+
+
 - (void)applyModifiers
 {
-    if (_muted) {
-        [_player setVolume:0];
-        [_player setMuted:YES];
-    } else {
-        [_player setVolume:_volume];
-        [_player setMuted:NO];
-    }
-    
-    [self setSelectedAudioTrack:_selectedAudioTrack];
-    [self setSelectedTextTrack:_selectedTextTrack];
-    [self setResizeMode:_resizeMode];
-    [self setRepeat:_repeat];
-    [self setPaused:_paused];
-    [self setControls:_controls];
-    [self setAllowsExternalPlayback:_allowsExternalPlayback];
+  if (_muted) {
+    [_player setVolume:0];
+    [_player setMuted:YES];
+  } else {
+    [_player setVolume:_volume];
+    [_player setMuted:NO];
+  }
+  
+  [self setMaxBitRate:_maxBitRate];
+  [self setSelectedAudioTrack:_selectedAudioTrack];
+  [self setSelectedTextTrack:_selectedTextTrack];
+  [self setResizeMode:_resizeMode];
+  [self setRepeat:_repeat];
+  [self setPaused:_paused];
+  [self setControls:_controls];
+  [self setAllowsExternalPlayback:_allowsExternalPlayback];
 }
 
 - (void)setRepeat:(BOOL)repeat {
@@ -985,40 +1089,40 @@ static int const RCTVideoUnset = -1;
     AVMediaSelectionGroup *group = [_player.currentItem.asset
                                     mediaSelectionGroupForMediaCharacteristic:characteristic];
     AVMediaSelectionOption *mediaOption;
-    
+  
     if ([type isEqualToString:@"disabled"]) {
-        // Do nothing. We want to ensure option is nil
+      // Do nothing. We want to ensure option is nil
     } else if ([type isEqualToString:@"language"] || [type isEqualToString:@"title"]) {
         NSString *value = criteria[@"value"];
         for (int i = 0; i < group.options.count; ++i) {
             AVMediaSelectionOption *currentOption = [group.options objectAtIndex:i];
             NSString *optionValue;
             if ([type isEqualToString:@"language"]) {
-                optionValue = [currentOption extendedLanguageTag];
+              optionValue = [currentOption extendedLanguageTag];
             } else {
-                optionValue = [[[currentOption commonMetadata]
-                                valueForKey:@"value"]
-                               objectAtIndex:0];
+              optionValue = [[[currentOption commonMetadata]
+                              valueForKey:@"value"]
+                             objectAtIndex:0];
             }
             if ([value isEqualToString:optionValue]) {
-                mediaOption = currentOption;
-                break;
+              mediaOption = currentOption;
+              break;
             }
-        }
-        //} else if ([type isEqualToString:@"default"]) {
-        //  option = group.defaultOption; */
+      }
+      //} else if ([type isEqualToString:@"default"]) {
+      //  option = group.defaultOption; */
     } else if ([type isEqualToString:@"index"]) {
         if ([criteria[@"value"] isKindOfClass:[NSNumber class]]) {
-            int index = [criteria[@"value"] intValue];
-            if (group.options.count > index) {
-                mediaOption = [group.options objectAtIndex:index];
-            }
+          int index = [criteria[@"value"] intValue];
+          if (group.options.count > index) {
+            mediaOption = [group.options objectAtIndex:index];
+          }
         }
     } else { // default. invalid type or "system"
-        [_player.currentItem selectMediaOptionAutomaticallyInMediaSelectionGroup:group];
-        return;
+      [_player.currentItem selectMediaOptionAutomaticallyInMediaSelectionGroup:group];
+      return;
     }
-    
+  
     // If a match isn't found, option will be nil and text tracks will be disabled
     [_player.currentItem selectMediaOption:mediaOption inMediaSelectionGroup:group];
 }
@@ -1098,13 +1202,12 @@ static int const RCTVideoUnset = -1;
             }
         }
     }
-    
-    for (int i = firstTextIndex; i < _player.currentItem.tracks.count; ++i) {
-        BOOL isEnabled = NO;
-        if (selectedTrackIndex != RCTVideoUnset) {
-            isEnabled = i == selectedTrackIndex + firstTextIndex;
-        }
-        [_player.currentItem.tracks[i] setEnabled:isEnabled];
+  }
+  
+  for (int i = firstTextIndex; i < _player.currentItem.tracks.count; ++i) {
+    BOOL isEnabled = NO;
+    if (selectedTrackIndex != RCTVideoUnset) {
+      isEnabled = i == selectedTrackIndex + firstTextIndex;
     }
 }
 
@@ -1153,10 +1256,10 @@ static int const RCTVideoUnset = -1;
 
 - (void)setTextTracks:(NSArray*) textTracks;
 {
-    _textTracks = textTracks;
-    
-    // in case textTracks was set after selectedTextTrack
-    if (_selectedTextTrack) [self setSelectedTextTrack:_selectedTextTrack];
+  _textTracks = textTracks;
+  
+  // in case textTracks was set after selectedTextTrack
+  if (_selectedTextTrack) [self setSelectedTextTrack:_selectedTextTrack];
 }
 
 - (NSArray *)getAudioTrackInfo
@@ -1169,7 +1272,7 @@ static int const RCTVideoUnset = -1;
         NSString *title = @"";
         NSArray *values = [[currentOption commonMetadata] valueForKey:@"value"];
         if (values.count > 0) {
-            title = [values objectAtIndex:0];
+          title = [values objectAtIndex:0];
         }
         NSString *language = [currentOption extendedLanguageTag] ? [currentOption extendedLanguageTag] : @"";
         NSDictionary *audioTrack = @{
@@ -1214,9 +1317,20 @@ static int const RCTVideoUnset = -1;
     return _fullscreenPlayerPresented;
 }
 
-- (void)setFullscreen:(BOOL)fullscreen
-{
-    if( fullscreen && !_fullscreenPlayerPresented )
+- (void)setFullscreen:(BOOL) fullscreen {
+  if( fullscreen && !_fullscreenPlayerPresented && _player )
+  {
+    // Ensure player view controller is not null
+    if( !_playerViewController )
+    {
+      [self usePlayerViewController];
+    }
+    // Set presentation style to fullscreen
+    [_playerViewController setModalPresentationStyle:UIModalPresentationFullScreen];
+    
+    // Find the nearest view controller
+    UIViewController *viewController = [self firstAvailableUIViewController];
+    if( !viewController )
     {
         // Ensure player view controller is not null
         if( !_playerViewController )
@@ -1254,42 +1368,74 @@ static int const RCTVideoUnset = -1;
     }
     else if ( !fullscreen && _fullscreenPlayerPresented )
     {
-        [self videoPlayerViewControllerWillDismiss:_playerViewController];
-        [_presentingViewController dismissViewControllerAnimated:true completion:^{
-            [self videoPlayerViewControllerDidDismiss:_playerViewController];
-        }];
+      _presentingViewController = viewController;
+      if(self.onVideoFullscreenPlayerWillPresent) {
+        self.onVideoFullscreenPlayerWillPresent(@{@"target": self.reactTag});
+      }
+      [viewController presentViewController:_playerViewController animated:true completion:^{
+        _playerViewController.showsPlaybackControls = YES;
+        _fullscreenPlayerPresented = fullscreen;
+        _playerViewController.autorotate = _fullscreenAutorotate;
+        if(self.onVideoFullscreenPlayerDidPresent) {
+          self.onVideoFullscreenPlayerDidPresent(@{@"target": self.reactTag});
+        }
+      }];
     }
+}
+
+- (void)setFullscreenAutorotate:(BOOL)autorotate {
+  _fullscreenAutorotate = autorotate;
+  if (_fullscreenPlayerPresented) {
+    _playerViewController.autorotate = autorotate;
+  }
+}
+
+- (void)setFullscreenOrientation:(NSString *)orientation {
+  _fullscreenOrientation = orientation;
+  if (_fullscreenPlayerPresented) {
+    _playerViewController.preferredOrientation = orientation;
+  }
 }
 
 - (void)usePlayerViewController
 {
-    if( _player )
-    {
-        _playerViewController = [self createPlayerViewController:_player withPlayerItem:_playerItem];
-        // to prevent video from being animated when resizeMode is 'cover'
-        // resize mode must be set before subview is added
-        [self setResizeMode:_resizeMode];
-        [self addSubview:_playerViewController.view];
+  if( _player )
+  {
+    _playerViewController = [self createPlayerViewController:_player withPlayerItem:_playerItem];
+    // to prevent video from being animated when resizeMode is 'cover'
+    // resize mode must be set before subview is added
+    [self setResizeMode:_resizeMode];
+    
+    if (_controls) {
+      UIViewController *viewController = [self reactViewController];
+      [viewController addChildViewController:_playerViewController];
+      [self addSubview:_playerViewController.view];
     }
+    
+    [_playerViewController.contentOverlayView addObserver:self forKeyPath:@"frame" options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionOld context:NULL];
+  }
 }
 
 - (void)usePlayerLayer
 {
-    if( _player )
-    {
-        _playerLayer = [AVPlayerLayer playerLayerWithPlayer:_player];
-        _playerLayer.frame = self.bounds;
-        _playerLayer.needsDisplayOnBoundsChange = YES;
-        
-        // to prevent video from being animated when resizeMode is 'cover'
-        // resize mode must be set before layer is added
-        [self setResizeMode:_resizeMode];
-        [_playerLayer addObserver:self forKeyPath:readyForDisplayKeyPath options:NSKeyValueObservingOptionNew context:nil];
-        _playerLayerObserverSet = YES;
-        
-        [self.layer addSublayer:_playerLayer];
-        self.layer.needsDisplayOnBoundsChange = YES;
-    }
+  if( _player )
+  {
+    _playerLayer = [AVPlayerLayer playerLayerWithPlayer:_player];
+    _playerLayer.frame = self.bounds;
+    _playerLayer.needsDisplayOnBoundsChange = YES;
+    
+    // to prevent video from being animated when resizeMode is 'cover'
+    // resize mode must be set before layer is added
+    [self setResizeMode:_resizeMode];
+    [_playerLayer addObserver:self forKeyPath:readyForDisplayKeyPath options:NSKeyValueObservingOptionNew context:nil];
+    _playerLayerObserverSet = YES;
+    
+    [self.layer addSublayer:_playerLayer];
+    self.layer.needsDisplayOnBoundsChange = YES;
+    #if TARGET_OS_IOS
+    [self setupPipController];
+    #endif
+  }
 }
 
 - (void)setControls:(BOOL)controls
@@ -1313,12 +1459,12 @@ static int const RCTVideoUnset = -1;
 
 - (void)setProgressUpdateInterval:(float)progressUpdateInterval
 {
-    _progressUpdateInterval = progressUpdateInterval;
-    
-    if (_timeObserver) {
-        [self removePlayerTimeObserver];
-        [self addPlayerTimeObserver];
-    }
+  _progressUpdateInterval = progressUpdateInterval;
+  
+  if (_timeObserver) {
+    [self removePlayerTimeObserver];
+    [self addPlayerTimeObserver];
+  }
 }
 
 - (void)removePlayerLayer
@@ -1353,6 +1499,36 @@ static int const RCTVideoUnset = -1;
             self.onVideoFullscreenPlayerDidDismiss(@{@"target": self.reactTag});
         }
     }
+}
+
+- (void)setFilter:(NSString *)filterName {
+    _filterName = filterName;
+
+    if (!_filterEnabled) {
+        return;
+    } else if ([[_source objectForKey:@"uri"] rangeOfString:@"m3u8"].location != NSNotFound) {
+        return; // filters don't work for HLS... return
+    } else if (!_playerItem.asset) {
+        return;
+    }
+    
+    CIFilter *filter = [CIFilter filterWithName:filterName];
+    _playerItem.videoComposition = [AVVideoComposition
+                                    videoCompositionWithAsset:_playerItem.asset
+                                    applyingCIFiltersWithHandler:^(AVAsynchronousCIImageFilteringRequest *_Nonnull request) {
+        if (filter == nil) {
+            [request finishWithImage:request.sourceImage context:nil];
+        } else {
+            CIImage *image = request.sourceImage.imageByClampingToExtent;
+            [filter setValue:image forKey:kCIInputImageKey];
+            CIImage *output = [filter.outputImage imageByCroppingToRect:request.sourceImage.extent];
+            [request finishWithImage:output context:nil];
+        }
+    }];
+}
+
+- (void)setFilterEnabled:(BOOL)filterEnabled {
+  _filterEnabled = filterEnabled;
 }
 
 #pragma mark - React View Management
@@ -1416,29 +1592,144 @@ static int const RCTVideoUnset = -1;
 
 - (void)removeFromSuperview
 {
-    [_player pause];
-    if (_playbackRateObserverRegistered) {
-        [_player removeObserver:self forKeyPath:playbackRate context:nil];
-        _playbackRateObserverRegistered = NO;
-    }
-    _player = nil;
-    if (_adsManager) {
-        [_adsManager destroy];
-        _adsManager = nil;
-    }
-    
-    [self removePlayerLayer];
-    
-    [_playerViewController.view removeFromSuperview];
-    _playerViewController = nil;
-    
-    [self removePlayerTimeObserver];
-    [self removePlayerItemObservers];
-    
-    _eventDispatcher = nil;
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-    
-    [super removeFromSuperview];
+  [_player pause];
+  if (_playbackRateObserverRegistered) {
+    [_player removeObserver:self forKeyPath:playbackRate context:nil];
+    _playbackRateObserverRegistered = NO;
+  }
+  if (_isExternalPlaybackActiveObserverRegistered) {
+    [_player removeObserver:self forKeyPath:externalPlaybackActive context:nil];
+    _isExternalPlaybackActiveObserverRegistered = NO;
+  }
+  _player = nil;
+  
+  [self removePlayerLayer];
+  
+  [_playerViewController.contentOverlayView removeObserver:self forKeyPath:@"frame"];
+  [_playerViewController.view removeFromSuperview];
+  _playerViewController = nil;
+  
+  [self removePlayerTimeObserver];
+  [self removePlayerItemObservers];
+  
+  _eventDispatcher = nil;
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
+  
+  [super removeFromSuperview];
 }
+
+#pragma mark - Export
+
+- (void)save:(NSDictionary *)options resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+
+    AVAsset *asset = _playerItem.asset;
+
+    if (asset != nil) {
+
+        AVAssetExportSession *exportSession = [AVAssetExportSession
+                exportSessionWithAsset:asset presetName:AVAssetExportPresetHighestQuality];
+
+        if (exportSession != nil) {
+            NSString *path = nil;
+            NSArray *array = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+            path = [self generatePathInDirectory:[[self cacheDirectoryPath] stringByAppendingPathComponent:@"Videos"]
+                                   withExtension:@".mp4"];
+            NSURL *url = [NSURL fileURLWithPath:path];
+            exportSession.outputFileType = AVFileTypeMPEG4;
+            exportSession.outputURL = url;
+            exportSession.videoComposition = _playerItem.videoComposition;
+            exportSession.shouldOptimizeForNetworkUse = true;
+            [exportSession exportAsynchronouslyWithCompletionHandler:^{
+
+                switch ([exportSession status]) {
+                    case AVAssetExportSessionStatusFailed:
+                        reject(@"ERROR_COULD_NOT_EXPORT_VIDEO", @"Could not export video", exportSession.error);
+                        break;
+                    case AVAssetExportSessionStatusCancelled:
+                        reject(@"ERROR_EXPORT_SESSION_CANCELLED", @"Export session was cancelled", exportSession.error);
+                        break;
+                    default:
+                        resolve(@{@"uri": url.absoluteString});
+                        break;
+                }
+
+            }];
+
+        } else {
+
+            reject(@"ERROR_COULD_NOT_CREATE_EXPORT_SESSION", @"Could not create export session", nil);
+
+        }
+
+    } else {
+
+        reject(@"ERROR_ASSET_NIL", @"Asset is nil", nil);
+
+    }
+}
+
+- (BOOL)ensureDirExistsWithPath:(NSString *)path {
+    BOOL isDir = NO;
+    NSError *error;
+    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir];
+    if (!(exists && isDir)) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:&error];
+        if (error) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+- (NSString *)generatePathInDirectory:(NSString *)directory withExtension:(NSString *)extension {
+    NSString *fileName = [[[NSUUID UUID] UUIDString] stringByAppendingString:extension];
+    [self ensureDirExistsWithPath:directory];
+    return [directory stringByAppendingPathComponent:fileName];
+}
+
+- (NSString *)cacheDirectoryPath {
+    NSArray *array = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    return array[0];
+}
+
+#pragma mark - Picture in Picture
+
+#if TARGET_OS_IOS
+- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+  if (self.onPictureInPictureStatusChanged) {
+    self.onPictureInPictureStatusChanged(@{
+      @"isActive": [NSNumber numberWithBool:false]
+    });
+  }
+}
+
+- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+  if (self.onPictureInPictureStatusChanged) {
+    self.onPictureInPictureStatusChanged(@{
+      @"isActive": [NSNumber numberWithBool:true]
+    });
+  }
+}
+
+- (void)pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+
+}
+
+- (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController failedToStartPictureInPictureWithError:(NSError *)error {
+
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL))completionHandler {
+  NSAssert(_restoreUserInterfaceForPIPStopCompletionHandler == NULL, @"restoreUserInterfaceForPIPStopCompletionHandler was not called after picture in picture was exited.");
+  if (self.onRestoreUserInterfaceForPictureInPictureStop) {
+    self.onRestoreUserInterfaceForPictureInPictureStop(@{});
+  }
+  _restoreUserInterfaceForPIPStopCompletionHandler = completionHandler;
+}
+#endif
 
 @end
