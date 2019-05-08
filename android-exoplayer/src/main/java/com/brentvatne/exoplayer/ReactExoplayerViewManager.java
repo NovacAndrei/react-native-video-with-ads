@@ -272,6 +272,8 @@ public class ReactExoplayerViewManager extends ViewGroupManager<ReactExoplayerVi
             default:
                 break;
         }
+    }
+    
     @ReactProp(name = PROP_HIDE_SHUTTER_VIEW, defaultBoolean = false)
     public void setHideShutterView(final ReactExoplayerView videoView, final boolean hideShutterView) {
         videoView.setHideShutterView(hideShutterView);
