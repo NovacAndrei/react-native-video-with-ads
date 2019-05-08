@@ -267,6 +267,8 @@ export default class Video extends Component {
     if (this.props.onBuffer) {
       this.props.onAdStarted(event.nativeEvent);
     }
+  };
+
   getViewManagerConfig = viewManagerName => {
     if (!NativeModules.UIManager.getViewManagerConfig) {
       return NativeModules.UIManager[viewManagerName];
