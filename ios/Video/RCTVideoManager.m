@@ -20,7 +20,7 @@ RCTVideo * _video;
 
 - (dispatch_queue_t)methodQueue
 {
-    return self.bridge.uiManager.methodQueue;
+    return dispatch_get_main_queue();
 }
 
 RCT_EXPORT_VIEW_PROPERTY(src, NSDictionary);
